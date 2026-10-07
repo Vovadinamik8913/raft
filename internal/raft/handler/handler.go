@@ -1,27 +1,40 @@
 package handler
 
 import (
-	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/Vovadinamik8913/raft/internal/raft/model"
 	"github.com/Vovadinamik8913/raft/internal/raft/node"
+	"github.com/gin-gonic/gin"
 )
 
-func HandleRequestVote(n *node.RaftNode) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func NewRouter(n *node.RaftNode, logger *slog.Logger) http.Handler {
+	gin.SetMode(gin.ReleaseMode)
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+
+	r.POST("/request_vote", handleRequestVote(n, logger))
+	r.POST("/append_entries", handleAppendEntries(n, logger))
+	r.GET("/status", handleStatus(n))
+
+	return r
+}
+
+func handleRequestVote(n *node.RaftNode, logger *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		var req model.RequestVoteRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 
 		n.State.Mu.Lock()
 		defer n.State.Mu.Unlock()
 
-		log.Printf("[%s] Received RequestVote from %s for term %d",
-			n.ID, req.CandidateID, req.Term)
+		logger.Info("received RequestVote",
+			"from", req.CandidateID, "term", req.Term)
 
 		if req.Term > n.State.CurrentTerm {
 			n.State.CurrentTerm = req.Term
@@ -38,22 +51,23 @@ func HandleRequestVote(n *node.RaftNode) http.HandlerFunc {
 			}
 		}
 
-		log.Printf("[%s] Voting %v for %s in term %d",
-			n.ID, voteGranted, req.CandidateID, req.Term)
+		logger.Info("voting",
+			"granted", voteGranted,
+			"candidate", req.CandidateID,
+			"term", req.Term)
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(model.RequestVoteResponse{
+		c.JSON(http.StatusOK, model.RequestVoteResponse{
 			Term:        n.State.CurrentTerm,
 			VoteGranted: voteGranted,
 		})
 	}
 }
 
-func HandleAppendEntries(n *node.RaftNode) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func handleAppendEntries(n *node.RaftNode, logger *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		var req model.AppendEntriesRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 
@@ -74,27 +88,23 @@ func HandleAppendEntries(n *node.RaftNode) http.HandlerFunc {
 			success = true
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(model.AppendEntriesResponse{
+		c.JSON(http.StatusOK, model.AppendEntriesResponse{
 			Term:    n.State.CurrentTerm,
 			Success: success,
 		})
 	}
 }
 
-func HandleStatus(n *node.RaftNode) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func handleStatus(n *node.RaftNode) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		n.State.Mu.RLock()
 		defer n.State.Mu.RUnlock()
 
-		status := model.NodeStatus{
+		c.JSON(http.StatusOK, model.NodeStatus{
 			ID:       n.ID,
 			State:    n.State.State.String(),
 			Term:     n.State.CurrentTerm,
 			LeaderID: n.State.LeaderID,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(status)
+		})
 	}
 }

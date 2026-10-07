@@ -1,36 +1,93 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/Vovadinamik8913/raft/internal/raft/handler"
 	"github.com/Vovadinamik8913/raft/internal/raft/node"
 )
 
 func main() {
-	id := flag.String("id", "node1", "Node ID")
-	port := flag.String("port", "8000", "Port to listen on")
-	peersFlag := flag.String("peers", "", "Comma-separated list of peer URLs")
+	var (
+		id        = flag.String("id", "node1", "Unique node ID")
+		port      = flag.String("port", "8000", "HTTP port to listen on")
+		peersFlag = flag.String("peers", "", "Comma-separated peer URLs")
+	)
 	flag.Parse()
 
-	var peers []string
-	if *peersFlag != "" {
-		peers = strings.Split(*peersFlag, ",")
+	logger := newLogger("info", *id)
+	peers := parsePeers(*peersFlag)
+	if len(peers) == 0 {
+		logger.Warn("no peers configured — running single-node cluster")
 	}
 
 	n := node.NewRaftNode(*id, peers)
+
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	go n.Run()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/request_vote", handler.HandleRequestVote(n))
-	mux.HandleFunc("/append_entries", handler.HandleAppendEntries(n))
-	mux.HandleFunc("/status", handler.HandleStatus(n))
-
-	log.Printf("[%s] Starting server on :%s", *id, *port)
-	if err := http.ListenAndServe(":"+*port, mux); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	srv := &http.Server{
+		Addr:              ":" + *port,
+		Handler:           handler.NewRouter(n, logger),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
+
+	go func() {
+		logger.Info("http server listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
+			logger.Error("http server failed", "err", err)
+			cancel()
+		}
+	}()
+
+	<-ctx.Done()
+	logger.Info("shutting down")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(
+		context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	_ = srv.Shutdown(shutdownCtx)
+}
+
+func parsePeers(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func newLogger(level, id string) *slog.Logger {
+	var lvl slog.Level
+	switch level {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
+	return slog.New(h).With("node", id)
 }
