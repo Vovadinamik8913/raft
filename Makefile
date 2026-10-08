@@ -24,8 +24,7 @@ run: build
 # ===== Lint =====
 lint:
 	@echo "Linting..."
-	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-	@golangci-lint run --tests=false --disable-all --timeout=2m -p error
+	@go vet ./...
 
 # ===== Cleanup =====
 clean:

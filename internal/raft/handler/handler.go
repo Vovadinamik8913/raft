@@ -1,110 +1,77 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 
 	"github.com/Vovadinamik8913/raft/internal/raft/model"
 	"github.com/Vovadinamik8913/raft/internal/raft/node"
+	"strings"
+
 	"github.com/gin-gonic/gin"
 )
 
 func NewRouter(n *node.RaftNode, logger *slog.Logger) http.Handler {
 	gin.SetMode(gin.ReleaseMode)
-
-	r := gin.New()
-	r.Use(gin.Recovery())
-
-	r.POST("/request_vote", handleRequestVote(n, logger))
-	r.POST("/append_entries", handleAppendEntries(n, logger))
-	r.GET("/status", handleStatus(n))
-
-	return r
-}
-
-func handleRequestVote(n *node.RaftNode, logger *slog.Logger) gin.HandlerFunc {
-	return func(c *gin.Context) {
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.GET("/status", func(c *gin.Context) {
+		c.JSON(http.StatusOK, n.Status())
+	})
+	router.POST("/request_vote", func(c *gin.Context) {
 		var req model.RequestVoteRequest
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeRequest(c, &req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-
-		n.State.Mu.Lock()
-		defer n.State.Mu.Unlock()
-
-		logger.Info("received RequestVote",
-			"from", req.CandidateID, "term", req.Term)
-
-		if req.Term > n.State.CurrentTerm {
-			n.State.CurrentTerm = req.Term
-			n.State.State = model.Follower
-			n.State.VotedFor = ""
+		if req.Term < 0 || strings.TrimSpace(req.CandidateID) == "" || req.LastLogIndex < 0 || req.LastLogTerm < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid RequestVote fields"})
+			return
 		}
-
-		voteGranted := false
-		if req.Term == n.State.CurrentTerm {
-			if n.State.VotedFor == "" || n.State.VotedFor == req.CandidateID {
-				voteGranted = true
-				n.State.VotedFor = req.CandidateID
-				defer n.ResetElectionTimeout()
-			}
+		logger.Debug("received RequestVote", "candidate", req.CandidateID, "term", req.Term)
+		resp, err := n.RequestVote(req)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
 		}
-
-		logger.Info("voting",
-			"granted", voteGranted,
-			"candidate", req.CandidateID,
-			"term", req.Term)
-
-		c.JSON(http.StatusOK, model.RequestVoteResponse{
-			Term:        n.State.CurrentTerm,
-			VoteGranted: voteGranted,
-		})
-	}
-}
-
-func handleAppendEntries(n *node.RaftNode, logger *slog.Logger) gin.HandlerFunc {
-	return func(c *gin.Context) {
+		c.JSON(http.StatusOK, resp)
+	})
+	router.POST("/append_entries", func(c *gin.Context) {
 		var req model.AppendEntriesRequest
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeRequest(c, &req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-
-		n.State.Mu.Lock()
-		defer n.State.Mu.Unlock()
-
-		if req.Term > n.State.CurrentTerm {
-			n.State.CurrentTerm = req.Term
-			n.State.State = model.Follower
-			n.State.VotedFor = ""
+		if req.Term < 0 || strings.TrimSpace(req.LeaderID) == "" || req.PrevLogIndex < 0 || req.PrevLogTerm < 0 || req.LeaderCommit < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid AppendEntries fields"})
+			return
 		}
-
-		success := false
-		if req.Term == n.State.CurrentTerm {
-			n.State.State = model.Follower
-			n.State.LeaderID = req.LeaderID
-			defer n.ResetElectionTimeout()
-			success = true
+		if len(req.Entries) != 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Part 1 supports empty heartbeats only"})
+			return
 		}
-
-		c.JSON(http.StatusOK, model.AppendEntriesResponse{
-			Term:    n.State.CurrentTerm,
-			Success: success,
-		})
-	}
+		resp, err := n.AppendEntries(req)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, resp)
+	})
+	return router
 }
 
-func handleStatus(n *node.RaftNode) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		n.State.Mu.RLock()
-		defer n.State.Mu.RUnlock()
-
-		c.JSON(http.StatusOK, model.NodeStatus{
-			ID:       n.ID,
-			State:    n.State.State.String(),
-			Term:     n.State.CurrentTerm,
-			LeaderID: n.State.LeaderID,
-		})
+func decodeRequest(c *gin.Context, target any) error {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+	decoder := json.NewDecoder(c.Request.Body)
+	if err := decoder.Decode(target); err != nil {
+		return err
 	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("expected one JSON object")
+	}
+	return nil
 }

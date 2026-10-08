@@ -23,71 +23,65 @@ func main() {
 		peersFlag = flag.String("peers", "", "Comma-separated peer URLs")
 	)
 	flag.Parse()
-
-	logger := newLogger("info", *id)
-	peers := parsePeers(*peersFlag)
-	if len(peers) == 0 {
-		logger.Warn("no peers configured — running single-node cluster")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("node", *id)
+	n, err := node.NewRaftNode(*id, parsePeers(*peersFlag))
+	if err != nil {
+		logger.Error("invalid configuration", "err", err)
+		os.Exit(1)
 	}
 
-	n := node.NewRaftNode(*id, peers)
-
-	ctx, cancel := signal.NotifyContext(context.Background(),
-		os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
-	go n.Run()
+	raftDone := make(chan struct{})
+	go func() {
+		defer close(raftDone)
+		if err := n.Run(ctx); err != nil {
+			logger.Error("raft stopped", "err", err)
+			cancel()
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              ":" + *port,
 		Handler:           handler.NewRouter(n, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
+	serverDone := make(chan error, 1)
 	go func() {
 		logger.Info("http server listening", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil &&
-			!errors.Is(err, http.ErrServerClosed) {
-			logger.Error("http server failed", "err", err)
+		err := srv.ListenAndServe()
+		serverDone <- err
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			cancel()
 		}
 	}()
 
 	<-ctx.Done()
 	logger.Info("shutting down")
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(
-		context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
-	_ = srv.Shutdown(shutdownCtx)
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		_ = srv.Close()
+	}
+	<-raftDone
+	serverErr := <-serverDone
+	if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+		logger.Error("http server failed", "err", serverErr)
+		os.Exit(1)
+	}
+	if shutdownErr != nil {
+		logger.Error("http shutdown failed", "err", shutdownErr)
+		os.Exit(1)
+	}
 }
 
 func parsePeers(s string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
+	var peers []string
+	for _, peer := range strings.Split(s, ",") {
+		if peer = strings.TrimSpace(peer); peer != "" {
+			peers = append(peers, peer)
 		}
 	}
-	return out
-}
-
-func newLogger(level, id string) *slog.Logger {
-	var lvl slog.Level
-	switch level {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		lvl = slog.LevelInfo
-	}
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
-	return slog.New(h).With("node", id)
+	return peers
 }
