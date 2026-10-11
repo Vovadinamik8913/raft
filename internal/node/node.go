@@ -1,20 +1,19 @@
 package node
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand/v2"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Vovadinamik8913/raft/internal/raft/model"
+	"github.com/Vovadinamik8913/raft/internal/client"
+	"github.com/Vovadinamik8913/raft/internal/dto"
+	"github.com/Vovadinamik8913/raft/internal/entity"
+	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -26,13 +25,12 @@ const (
 var ErrUnavailable = errors.New("raft node unavailable")
 
 type RaftNode struct {
-	ID         string
-	Peers      []string
-	State      *model.State
-	httpClient *http.Client
-	wake       chan struct{}
+	ID     string
+	Peers  []string
+	State  *entity.State
+	client *client.Client
+	wake   chan struct{}
 
-	// Protected by State.Mu. Only Run owns and resets the actual timer.
 	electionDeadline time.Time
 	votes            map[string]bool
 	running          bool
@@ -42,8 +40,8 @@ type RaftNode struct {
 type rpcResult struct {
 	peer      string
 	term      int
-	vote      *model.RequestVoteResponse
-	heartbeat *model.AppendEntriesResponse
+	vote      *dto.RequestVoteResponse
+	heartbeat *dto.AppendEntriesResponse
 	err       error
 }
 
@@ -68,13 +66,12 @@ func NewRaftNode(id string, peers []string) (*RaftNode, error) {
 		}
 	}
 	return &RaftNode{
-		ID: id, Peers: unique, State: model.NewState(),
-		httpClient: &http.Client{Timeout: 400 * time.Millisecond},
-		wake:       make(chan struct{}, 1),
+		ID: id, Peers: unique, State: entity.NewState(),
+		client: client.New(),
+		wake:   make(chan struct{}, 1),
 	}, nil
 }
 
-// Run owns the timers and outbound RPC workers. It may be called once.
 func (n *RaftNode) Run(parent context.Context) error {
 	n.State.Mu.Lock()
 	if n.running || n.stopped {
@@ -82,7 +79,7 @@ func (n *RaftNode) Run(parent context.Context) error {
 		return ErrUnavailable
 	}
 	n.running = true
-	n.resetDeadlineLocked()
+	n.resetDeadline()
 	n.State.Mu.Unlock()
 	ctx, cancel := context.WithCancel(parent)
 	var workers sync.WaitGroup
@@ -101,7 +98,7 @@ func (n *RaftNode) Run(parent context.Context) error {
 		n.State.Mu.RLock()
 		role, deadline := n.State.State, n.electionDeadline
 		n.State.Mu.RUnlock()
-		if role == model.Leader {
+		if role == entity.Leader {
 			timer.Stop()
 		} else {
 			timer.Reset(max(time.Millisecond, time.Until(deadline)))
@@ -110,7 +107,6 @@ func (n *RaftNode) Run(parent context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-n.wake:
-			// Incoming RPCs already updated the deadline under the state lock.
 		case <-timer.C:
 			term, started := n.startElection()
 			if started {
@@ -136,25 +132,27 @@ func (n *RaftNode) Run(parent context.Context) error {
 func (n *RaftNode) startElection() (int, bool) {
 	n.State.Mu.Lock()
 	defer n.State.Mu.Unlock()
-	if n.State.State == model.Leader || time.Now().Before(n.electionDeadline) {
+	if n.State.State == entity.Leader || time.Now().Before(n.electionDeadline) {
 		return n.State.CurrentTerm, false
 	}
 	term := n.State.CurrentTerm + 1
 	n.State.CurrentTerm = term
 	n.State.VotedFor = n.ID
-	n.State.State = model.Candidate
+	n.State.State = entity.Candidate
 	n.State.LeaderID = ""
 	n.votes = map[string]bool{n.ID: true}
-	n.resetDeadlineLocked()
+	n.resetDeadline()
+	log.Info().Int("term", term).Msg("started election")
 	if len(n.Peers) == 0 {
-		n.becomeLeaderLocked()
+		n.becomeLeader()
 	}
 	return term, true
 }
 
-func (n *RaftNode) becomeLeaderLocked() {
-	n.State.State = model.Leader
+func (n *RaftNode) becomeLeader() {
+	n.State.State = entity.Leader
 	n.State.LeaderID = n.ID
+	log.Info().Int("term", n.State.CurrentTerm).Msg("became leader")
 }
 
 func (n *RaftNode) handleResult(result rpcResult) bool {
@@ -165,16 +163,17 @@ func (n *RaftNode) handleResult(result rpcResult) bool {
 	defer n.State.Mu.Unlock()
 	term := result.responseTerm()
 	if term > n.State.CurrentTerm {
-		n.followHigherTermLocked(term)
+		n.followHigherTerm(term)
 		return false
 	}
 	if result.vote == nil || !result.vote.VoteGranted || term != result.term ||
-		n.State.State != model.Candidate || n.State.CurrentTerm != result.term {
+		n.State.State != entity.Candidate || n.State.CurrentTerm != result.term {
 		return false
 	}
 	n.votes[result.peer] = true
+	log.Info().Str("peer", result.peer).Int("term", result.term).Msg("received vote")
 	if len(n.votes) >= (len(n.Peers)+1)/2+1 {
-		n.becomeLeaderLocked()
+		n.becomeLeader()
 		return true
 	}
 	return false
@@ -191,7 +190,7 @@ func (n *RaftNode) sendHeartbeats(ctx context.Context, workers *sync.WaitGroup, 
 	n.State.Mu.RLock()
 	role, term := n.State.State, n.State.CurrentTerm
 	n.State.Mu.RUnlock()
-	if role != model.Leader {
+	if role != entity.Leader {
 		return
 	}
 	for _, peer := range n.Peers {
@@ -208,11 +207,11 @@ func (n *RaftNode) launchRPC(ctx context.Context, workers *sync.WaitGroup, resul
 		defer workers.Done()
 		result := rpcResult{peer: peer, term: term}
 		if vote {
-			result.vote = &model.RequestVoteResponse{}
-			result.err = n.postRPC(ctx, peer+"/request_vote", model.RequestVoteRequest{Term: term, CandidateID: n.ID}, result.vote)
+			resp, err := n.client.RequestVote(ctx, peer, dto.RequestVoteRequest{Term: term, CandidateID: n.ID})
+			result.vote, result.err = &resp, err
 		} else {
-			result.heartbeat = &model.AppendEntriesResponse{}
-			result.err = n.postRPC(ctx, peer+"/append_entries", model.AppendEntriesRequest{Term: term, LeaderID: n.ID}, result.heartbeat)
+			resp, err := n.client.AppendEntries(ctx, peer, dto.AppendEntriesRequest{Term: term, LeaderID: n.ID})
+			result.heartbeat, result.err = &resp, err
 		}
 		select {
 		case results <- result:
@@ -221,107 +220,79 @@ func (n *RaftNode) launchRPC(ctx context.Context, workers *sync.WaitGroup, resul
 	}()
 }
 
-func (n *RaftNode) postRPC(ctx context.Context, endpoint string, req, response any) error {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return err
-	}
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	r.Header.Set("Content-Type", "application/json")
-	resp, err := n.httpClient.Do(r)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("RPC %s returned HTTP %d", endpoint, resp.StatusCode)
-	}
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
-	if err := decoder.Decode(response); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return errors.New("invalid RPC response: trailing JSON")
-	}
-	return nil
-}
-
-func (n *RaftNode) resetDeadlineLocked() {
+func (n *RaftNode) resetDeadline() {
 	n.electionDeadline = time.Now().Add(ElectionTimeoutMin + time.Duration(rand.Int64N(int64(ElectionTimeoutMax-ElectionTimeoutMin))))
-	n.notifyLocked()
+	n.notify()
 }
 
-func (n *RaftNode) notifyLocked() {
+func (n *RaftNode) notify() {
 	select {
 	case n.wake <- struct{}{}:
 	default:
 	}
 }
 
-func (n *RaftNode) followHigherTermLocked(term int) {
+func (n *RaftNode) followHigherTerm(term int) {
 	n.State.CurrentTerm = term
 	n.State.VotedFor = ""
-	n.State.State = model.Follower
+	n.State.State = entity.Follower
 	n.State.LeaderID = ""
 	n.votes = nil
-	n.resetDeadlineLocked()
+	n.resetDeadline()
 }
 
-func (n *RaftNode) RequestVote(req model.RequestVoteRequest) (model.RequestVoteResponse, error) {
+func (n *RaftNode) RequestVote(req dto.RequestVoteRequest) (dto.RequestVoteResponse, error) {
 	n.State.Mu.Lock()
 	defer n.State.Mu.Unlock()
 	if n.stopped {
-		return model.RequestVoteResponse{}, ErrUnavailable
+		return dto.RequestVoteResponse{}, ErrUnavailable
 	}
 	if req.Term > n.State.CurrentTerm {
-		n.followHigherTermLocked(req.Term)
+		n.followHigherTerm(req.Term)
 	}
-	resp := model.RequestVoteResponse{Term: n.State.CurrentTerm}
-	// All logs are empty in Part 1; every valid candidate log is up to date.
+	resp := dto.RequestVoteResponse{Term: n.State.CurrentTerm}
 	if req.Term == n.State.CurrentTerm && req.CandidateID != n.ID &&
 		(n.State.VotedFor == "" || n.State.VotedFor == req.CandidateID) {
 		n.State.VotedFor = req.CandidateID
 		resp.VoteGranted = true
-		n.resetDeadlineLocked()
+		n.resetDeadline()
 	}
+	log.Info().Str("candidate", req.CandidateID).Int("term", req.Term).
+		Bool("granted", resp.VoteGranted).Msg("vote request")
 	return resp, nil
 }
 
-func (n *RaftNode) AppendEntries(req model.AppendEntriesRequest) (model.AppendEntriesResponse, error) {
+func (n *RaftNode) AppendEntries(req dto.AppendEntriesRequest) (dto.AppendEntriesResponse, error) {
 	n.State.Mu.Lock()
 	defer n.State.Mu.Unlock()
 	if n.stopped {
-		return model.AppendEntriesResponse{}, ErrUnavailable
+		return dto.AppendEntriesResponse{}, ErrUnavailable
 	}
 	if req.Term > n.State.CurrentTerm {
-		n.followHigherTermLocked(req.Term)
+		n.followHigherTerm(req.Term)
 	}
-	resp := model.AppendEntriesResponse{Term: n.State.CurrentTerm}
+	resp := dto.AppendEntriesResponse{Term: n.State.CurrentTerm}
 	if req.Term == n.State.CurrentTerm && req.LeaderID != n.ID {
-		n.State.State = model.Follower
+		n.State.State = entity.Follower
 		n.State.LeaderID = req.LeaderID
 		n.votes = nil
-		n.resetDeadlineLocked()
-		// A heartbeat can only reference the empty log in Part 1.
+		n.resetDeadline()
 		resp.Success = req.PrevLogIndex == 0 && req.PrevLogTerm == 0
 	}
+	log.Info().Str("leader", req.LeaderID).Int("term", req.Term).Msg("received heartbeat")
 	return resp, nil
 }
 
-func (n *RaftNode) Status() model.NodeStatus {
+func (n *RaftNode) Status() dto.NodeStatus {
 	n.State.Mu.RLock()
 	defer n.State.Mu.RUnlock()
-	return model.NodeStatus{ID: n.ID, State: n.State.State.String(), Term: n.State.CurrentTerm, LeaderID: n.State.LeaderID}
+	return dto.NodeStatus{ID: n.ID, State: n.State.State.String(), Term: n.State.CurrentTerm, LeaderID: n.State.LeaderID}
 }
 
 func (n *RaftNode) stop() {
 	n.State.Mu.Lock()
 	defer n.State.Mu.Unlock()
 	n.stopped = true
-	n.State.State = model.Follower
+	n.State.State = entity.Follower
 	n.State.LeaderID = ""
 }

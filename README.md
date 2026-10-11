@@ -144,18 +144,33 @@ make run ARGS="--id=node2 --port=8002 \
 .
 ├── cmd/
 │   └── raft-node/
-│       └── main.go           # Точка входа: флаги, HTTP-сервер, graceful shutdown
+│       └── main.go           # Точка входа: конфигурация, логгер, сигналы, код завершения
 ├── docs/
 │   └── raft.pdf              # Оригинальная статья
 ├── internal/
-│   └── raft/
-│       ├── handler/          # Тонкий HTTP-слой (JSON ↔ вызовы метода узла)
-│       │   └── handler.go
-│       ├── model/            # Типы данных и разделяемое состояние
-│       │   ├── models.go     # DTO RPC, NodeStatus
-│       │   └── state.go      # State (term, votedFor, role) + мьютекс
-│       └── node/             # Логика узла Raft (выборы, heartbeat)
-│           └── node.go
+│   ├── app/
+│   │   ├── app.go            # Запуск сервисов, отмена контекста, ожидание завершения
+│   │   └── shutdown.go       # Graceful shutdown с таймаутом и fallback Close
+│   ├── config/
+│   │   └── config.go         # Флаги командной строки и список пиров
+│   ├── logging/
+│   │   └── logger.go         # Настройка консольного zerolog
+│   ├── server/
+│   │   ├── server.go         # Настройка и запуск HTTP-сервера
+│   │   └── router.go         # Маршруты Gin и middleware
+│   ├── dto/
+│   │   ├── request_vote.go   # RequestVote: JSON-запрос и ответ
+│   │   ├── append_entries.go # AppendEntries: JSON-запрос и ответ
+│   │   └── status.go         # NodeStatus: JSON-ответ /status
+│   ├── entity/
+│   │   ├── node_state.go     # Роли FOLLOWER, CANDIDATE, LEADER
+│   │   └── state.go          # Состояние узла и мьютекс
+│   ├── controller/
+│   │   └── controller.go     # Декодирование, валидация, методы узла, JSON-ответы
+│   ├── client/
+│   │   └── client.go         # Отправка RequestVote и AppendEntries по HTTP
+│   └── node/
+│       └── node.go           # Выборы лидера и heartbeat
 ├── Makefile
 ├── README.md
 └── go.mod
@@ -163,15 +178,35 @@ make run ARGS="--id=node2 --port=8002 \
 
 Пакеты разделены по слоям:
 
-- **`model`** — «тупые» данные без логики. Переиспользуется и `handler`,
-  и `node`.
-- **`node`** — ядро алгоритма: переходы состояний, таймеры, RPC к пирам.
-- **`handler`** — HTTP-обвязка. Знает только про JSON и `*node.RaftNode`.
-- **`cmd/raft-node`** — склейка: парсинг флагов, `signal.NotifyContext`,
-  `http.Server`.
+- **`dto`** — структуры HTTP-запросов и ответов с JSON-тегами:
+  RequestVote, AppendEntries и NodeStatus. Используются `controller`, `node` и `client`.
+- **`entity`** — внутренние роли и состояние узла: term, votedFor,
+  leader ID и мьютекс. Используется `node`.
+- **`node`** — ядро алгоритма: переходы состояний, таймеры, запуск RPC к пирам
+  и обработка результатов.
+- **`client`** — отправка RequestVote и AppendEntries по HTTP: сериализация JSON,
+  таймаут 400 мс, отмена через контекст и проверка ответов.
+- **`controller`** — обработчики HTTP: декодирование и валидация JSON,
+  вызовы методов узла и формирование ответов.
+- **`config`** — конфигурация узла из флагов командной строки.
+- **`logging`** — настройка общего zerolog-логгера с ID узла.
+- **`server`** — настройка HTTP-сервера, маршруты Gin и middleware
+  в `router.go`, вызов `ListenAndServe`.
+- **`app`** — создание узла и сервера, запуск сервисов, отмена контекста
+  при ошибке, остановка HTTP и ожидание обеих горутин.
+- **`cmd/raft-node`** — только `main.go`: читает конфигурацию, создаёт логгер
+  и контекст сигналов, вызывает `app.Run`, сообщает об ошибках и выбирает
+  код завершения.
+
+Логи пишутся в stderr через **zerolog** в читаемом консольном формате:
+время, уровень, сообщение и структурированные поля с ID узла (`node`).
+Минимальный уровень — `INFO`; логируются начало выборов, решение о выдаче
+голоса, полученные голоса, выбор лидера и получение heartbeat. В сообщениях
+указываются term и участник. Ошибки сервисов возвращаются в `main`;
+сообщения пишутся без буферизации до `os.Exit`.
 
 Такое разделение позволит в Part 2–4 добавлять подпакеты (например,
-`internal/raft/log`, `internal/kv`, `internal/lock`) без переписывания
+`internal/log`, `internal/kv`, `internal/lock`) без переписывания
 существующих слоёв.
 
 ## Как это работает
@@ -206,6 +241,9 @@ Part 1 хранит `currentTerm` и `votedFor` только в памяти: п
 Голоса учитываются по мере получения и только для текущих выборов.
 У лидера таймер выборов отключён; heartbeat отправляется сразу после победы.
 Ctrl+C останавливает таймеры, отменяет исходящие RPC и завершает HTTP-сервер.
+
+DTO содержат поля текущего этапа: `last_log_index`, `last_log_term` и
+`leader_commit` пока отсутствуют; они понадобятся при реализации репликации лога.
 
 REST API использует Gin. `/append_entries` принимает только пустые heartbeat:
 `entries: []`, `null` или отсутствие поля. Непустые `entries` возвращают HTTP 400.
