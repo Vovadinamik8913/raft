@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"github.com/Vovadinamik8913/raft/internal/config"
-	"github.com/Vovadinamik8913/raft/internal/node"
+	node "github.com/Vovadinamik8913/raft/internal/core"
 	"github.com/Vovadinamik8913/raft/internal/server"
 	"github.com/rs/zerolog/log"
 )

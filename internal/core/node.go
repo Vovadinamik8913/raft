@@ -17,19 +17,20 @@ import (
 )
 
 const (
-	ElectionTimeoutMin = 500 * time.Millisecond
-	ElectionTimeoutMax = 1000 * time.Millisecond
-	HeartbeatInterval  = 100 * time.Millisecond
+	ElectionTimeoutMin = 5000 * time.Millisecond
+	ElectionTimeoutMax = 10000 * time.Millisecond
+	HeartbeatInterval  = 500 * time.Millisecond
 )
 
 var ErrUnavailable = errors.New("raft node unavailable")
 
 type RaftNode struct {
-	ID     string
-	Peers  []string
-	State  *entity.State
-	client *client.Client
-	wake   chan struct{}
+	ID      string
+	Peers   []string
+	State   *entity.State
+	client  *client.Client
+	wake    chan struct{}
+	changed chan struct{}
 
 	electionDeadline time.Time
 	votes            map[string]bool
@@ -42,7 +43,13 @@ type rpcResult struct {
 	term      int
 	vote      *dto.RequestVoteResponse
 	heartbeat *dto.AppendEntriesResponse
+	appendReq *dto.AppendEntriesRequest
 	err       error
+}
+
+type rpcRequest struct {
+	vote   *dto.RequestVoteRequest
+	append *dto.AppendEntriesRequest
 }
 
 func NewRaftNode(id string, peers []string) (*RaftNode, error) {
@@ -67,8 +74,9 @@ func NewRaftNode(id string, peers []string) (*RaftNode, error) {
 	}
 	return &RaftNode{
 		ID: id, Peers: unique, State: entity.NewState(),
-		client: client.New(),
-		wake:   make(chan struct{}, 1),
+		client:  client.New(),
+		wake:    make(chan struct{}, 1),
+		changed: make(chan struct{}),
 	}, nil
 }
 
@@ -107,11 +115,16 @@ func (n *RaftNode) Run(parent context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-n.wake:
+			n.sendHeartbeats(ctx, &workers, results, heartbeatsInFlight)
 		case <-timer.C:
 			term, started := n.startElection()
 			if started {
+				n.State.Mu.RLock()
+				lastIndex, lastTerm := n.lastLogInfo()
+				n.State.Mu.RUnlock()
 				for _, peer := range n.Peers {
-					n.launchRPC(ctx, &workers, results, peer, term, true)
+					req := dto.RequestVoteRequest{Term: term, CandidateID: n.ID, LastLogIndex: lastIndex, LastLogTerm: lastTerm}
+					n.launchRPC(ctx, &workers, results, peer, rpcRequest{vote: &req})
 				}
 				n.sendHeartbeats(ctx, &workers, results, heartbeatsInFlight)
 			}
@@ -152,6 +165,12 @@ func (n *RaftNode) startElection() (int, bool) {
 func (n *RaftNode) becomeLeader() {
 	n.State.State = entity.Leader
 	n.State.LeaderID = n.ID
+	n.State.NextIndex = make(map[string]int, len(n.Peers))
+	n.State.MatchIndex = make(map[string]int, len(n.Peers))
+	for _, peer := range n.Peers {
+		n.State.NextIndex[peer] = len(n.State.Log) + 1
+	}
+	n.advanceCommit()
 	log.Info().Int("term", n.State.CurrentTerm).Msg("became leader")
 }
 
@@ -164,6 +183,23 @@ func (n *RaftNode) handleResult(result rpcResult) bool {
 	term := result.responseTerm()
 	if term > n.State.CurrentTerm {
 		n.followHigherTerm(term)
+		return false
+	}
+	if result.appendReq != nil {
+		if n.State.State != entity.Leader || n.State.CurrentTerm != result.term {
+			return false
+		}
+		if result.heartbeat.Success {
+			matched := result.appendReq.PrevLogIndex + len(result.appendReq.Entries)
+			if matched > n.State.MatchIndex[result.peer] {
+				n.State.MatchIndex[result.peer] = matched
+				n.State.NextIndex[result.peer] = matched + 1
+				n.advanceCommit()
+			}
+		} else if n.State.NextIndex[result.peer] > 1 {
+			n.State.NextIndex[result.peer]--
+			n.notify()
+		}
 		return false
 	}
 	if result.vote == nil || !result.vote.VoteGranted || term != result.term ||
@@ -195,22 +231,42 @@ func (n *RaftNode) sendHeartbeats(ctx context.Context, workers *sync.WaitGroup, 
 	}
 	for _, peer := range n.Peers {
 		if inFlight[peer] != term {
+			n.State.Mu.RLock()
+			next := n.State.NextIndex[peer]
+			if next < 1 {
+				next = 1
+			}
+			prev := next - 1
+			prevTerm := 0
+			if prev > 0 {
+				prevTerm = n.State.Log[prev-1].Term
+			}
+			entries := make([]entity.LogEntry, len(n.State.Log)-prev)
+			copy(entries, n.State.Log[prev:])
+			for i := range entries {
+				entries[i].Command = append([]byte(nil), entries[i].Command...)
+			}
+			req := dto.AppendEntriesRequest{Term: term, LeaderID: n.ID, PrevLogIndex: prev,
+				PrevLogTerm: prevTerm, Entries: entries, LeaderCommit: n.State.CommitIndex}
+			n.State.Mu.RUnlock()
 			inFlight[peer] = term
-			n.launchRPC(ctx, workers, results, peer, term, false)
+			n.launchRPC(ctx, workers, results, peer, rpcRequest{append: &req})
 		}
 	}
 }
 
-func (n *RaftNode) launchRPC(ctx context.Context, workers *sync.WaitGroup, results chan<- rpcResult, peer string, term int, vote bool) {
+func (n *RaftNode) launchRPC(ctx context.Context, workers *sync.WaitGroup, results chan<- rpcResult, peer string, req rpcRequest) {
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		result := rpcResult{peer: peer, term: term}
-		if vote {
-			resp, err := n.client.RequestVote(ctx, peer, dto.RequestVoteRequest{Term: term, CandidateID: n.ID})
+		result := rpcResult{peer: peer, appendReq: req.append}
+		if req.vote != nil {
+			result.term = req.vote.Term
+			resp, err := n.client.RequestVote(ctx, peer, *req.vote)
 			result.vote, result.err = &resp, err
 		} else {
-			resp, err := n.client.AppendEntries(ctx, peer, dto.AppendEntriesRequest{Term: term, LeaderID: n.ID})
+			result.term = req.append.Term
+			resp, err := n.client.AppendEntries(ctx, peer, *req.append)
 			result.heartbeat, result.err = &resp, err
 		}
 		select {
@@ -238,6 +294,7 @@ func (n *RaftNode) followHigherTerm(term int) {
 	n.State.State = entity.Follower
 	n.State.LeaderID = ""
 	n.votes = nil
+	n.signalChanged()
 	n.resetDeadline()
 }
 
@@ -252,7 +309,7 @@ func (n *RaftNode) RequestVote(req dto.RequestVoteRequest) (dto.RequestVoteRespo
 	}
 	resp := dto.RequestVoteResponse{Term: n.State.CurrentTerm}
 	if req.Term == n.State.CurrentTerm && req.CandidateID != n.ID &&
-		(n.State.VotedFor == "" || n.State.VotedFor == req.CandidateID) {
+		(n.State.VotedFor == "" || n.State.VotedFor == req.CandidateID) && n.candidateLogCurrent(req.LastLogIndex, req.LastLogTerm) {
 		n.State.VotedFor = req.CandidateID
 		resp.VoteGranted = true
 		n.resetDeadline()
@@ -265,6 +322,10 @@ func (n *RaftNode) RequestVote(req dto.RequestVoteRequest) (dto.RequestVoteRespo
 func (n *RaftNode) AppendEntries(req dto.AppendEntriesRequest) (dto.AppendEntriesResponse, error) {
 	n.State.Mu.Lock()
 	defer n.State.Mu.Unlock()
+	log.Info().Str("leader", req.LeaderID).Int("term", req.Term).
+		Int("prev_log_index", req.PrevLogIndex).Int("prev_log_term", req.PrevLogTerm).
+		Int("leader_commit", req.LeaderCommit).Interface("entries", req.Entries).
+		Msg("received append entries")
 	if n.stopped {
 		return dto.AppendEntriesResponse{}, ErrUnavailable
 	}
@@ -273,13 +334,39 @@ func (n *RaftNode) AppendEntries(req dto.AppendEntriesRequest) (dto.AppendEntrie
 	}
 	resp := dto.AppendEntriesResponse{Term: n.State.CurrentTerm}
 	if req.Term == n.State.CurrentTerm && req.LeaderID != n.ID {
+		if n.State.State == entity.Leader || n.State.State == entity.Candidate {
+			n.signalChanged()
+		}
 		n.State.State = entity.Follower
 		n.State.LeaderID = req.LeaderID
 		n.votes = nil
 		n.resetDeadline()
-		resp.Success = req.PrevLogIndex == 0 && req.PrevLogTerm == 0
+		if req.PrevLogIndex <= len(n.State.Log) &&
+			((req.PrevLogIndex == 0 && req.PrevLogTerm == 0) ||
+				(req.PrevLogIndex > 0 && n.State.Log[req.PrevLogIndex-1].Term == req.PrevLogTerm)) {
+			for i, entry := range req.Entries {
+				index := req.PrevLogIndex + i
+				if index < n.State.CommitIndex && n.State.Log[index].Term != entry.Term {
+					return resp, nil
+				}
+			}
+			resp.Success = true
+			for i, entry := range req.Entries {
+				index := req.PrevLogIndex + i
+				if index < len(n.State.Log) && n.State.Log[index].Term != entry.Term {
+					n.State.Log = n.State.Log[:index]
+				}
+				if index >= len(n.State.Log) {
+					n.State.Log = append(n.State.Log, entity.LogEntry{Term: entry.Term,
+						Command: append([]byte(nil), entry.Command...)})
+				}
+			}
+			if req.LeaderCommit > n.State.CommitIndex {
+				n.State.CommitIndex = min(req.LeaderCommit, len(n.State.Log))
+				n.signalChanged()
+			}
+		}
 	}
-	log.Info().Str("leader", req.LeaderID).Int("term", req.Term).Msg("received heartbeat")
 	return resp, nil
 }
 
@@ -295,4 +382,5 @@ func (n *RaftNode) stop() {
 	n.stopped = true
 	n.State.State = entity.Follower
 	n.State.LeaderID = ""
+	n.signalChanged()
 }
