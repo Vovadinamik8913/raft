@@ -191,9 +191,9 @@ func (n *RaftNode) handleResult(result rpcResult) bool {
 		}
 		if result.heartbeat.Success {
 			matched := result.appendReq.PrevLogIndex + len(result.appendReq.Entries)
+			n.State.NextIndex[result.peer] = matched + 1
 			if matched > n.State.MatchIndex[result.peer] {
 				n.State.MatchIndex[result.peer] = matched
-				n.State.NextIndex[result.peer] = matched + 1
 				n.advanceCommit()
 			}
 		} else if n.State.NextIndex[result.peer] > 1 {
