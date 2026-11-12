@@ -25,7 +25,7 @@ Algorithm (Extended Version)»* (`docs/raft.pdf`).
 | # | Тема                                                       | Срок    | Статус |
 |---|------------------------------------------------------------|---------|:------:|
 | 1 | Каркас + leader election + `/status` (REST API)            | до 19.10 | ✅     |
-| 2 | Репликация лога + `add_entries` / `show_log` (REST API)    | до 16.11 | ⏳     |
+| 2 | Репликация лога + `add_entries` / `show_log` (REST API)    | до 16.11 | ✅     |
 | 3 | Key-value поверх Raft + клиентский API (REST API)          | до 7.12  | ⏳     |
 | 4 | CAS на KV + distributed lock + клиентский API (REST API)   | до 31.12 | ⏳     |
 
@@ -91,13 +91,15 @@ curl -s http://localhost:8003/status | jq
 
 ## HTTP API
 
-### Реализовано (Part 1)
+### Реализовано (Part 1–2)
 
 | Метод | Путь              | Назначение                                    |
 |-------|-------------------|-----------------------------------------------|
 | POST  | `/request_vote`   | RPC `RequestVote` (§5.2 статьи)               |
-| POST  | `/append_entries` | RPC `AppendEntries` — в Part 1 только heartbeat (§5.3) |
+| POST  | `/append_entries` | RPC `AppendEntries` для heartbeat и репликации (§5.3) |
 | GET   | `/status`         | Текущее состояние узла                        |
+| POST  | `/add_entries`    | Добавить JSON-значения в лог лидера; ответ после фиксации кворумом |
+| GET   | `/show_log`       | Локальный лог узла и `commit_index`           |
 
 Пример `/status`:
 
@@ -112,11 +114,26 @@ curl -s http://localhost:8003/status | jq
 
 ### Планируется
 
-- `POST /add_entries` — добавление записи в лог (Part 2).
-- `GET  /show_log` — просмотр лога (Part 2).
 - `GET/PUT /kv/{key}` — key-value API (Part 3).
 - `POST /cas` — compare-and-swap (Part 4).
 - `POST /lock` / `DELETE /lock` — distributed lock (Part 4).
+
+Пример записи (отправлять на узел со `state: "LEADER"`):
+
+```bash
+curl -s -X POST http://localhost:8001/add_entries \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":["hello",{"event":"created"}]}' | jq
+curl -s http://localhost:8001/show_log | jq
+```
+
+`POST /add_entries` принимает непустой массив любых JSON-значений, кроме `null`.
+Успешный ответ: `{"first_index":1,"last_index":2,"commit_index":2}`.
+Узел, который не является лидером, отвечает HTTP 409 и сообщает `leader_id`,
+если он известен. Без кворума запрос ожидает подтверждения, пока клиент не
+прервёт его; запись остаётся в логе неподтверждённой. `GET /show_log` возвращает
+`{"entries":[{"index":1,"term":1,"command":"hello"}],"commit_index":1}`.
+Лог локальный: отстающий узел может временно показать меньше записей.
 
 ## Make-цели
 
@@ -161,16 +178,19 @@ make run ARGS="--id=node2 --port=8002 \
 │   ├── dto/
 │   │   ├── request_vote.go   # RequestVote: JSON-запрос и ответ
 │   │   ├── append_entries.go # AppendEntries: JSON-запрос и ответ
+│   │   ├── log.go            # add_entries/show_log: JSON-запросы и ответы
 │   │   └── status.go         # NodeStatus: JSON-ответ /status
 │   ├── entity/
 │   │   ├── node_state.go     # Роли FOLLOWER, CANDIDATE, LEADER
-│   │   └── state.go          # Состояние узла и мьютекс
+│   │   ├── state.go          # Состояние узла и мьютекс
+│   │   └── log_entry.go      # Запись лога: term и JSON-команда
 │   ├── controller/
 │   │   └── controller.go     # Декодирование, валидация, методы узла, JSON-ответы
 │   ├── client/
 │   │   └── client.go         # Отправка RequestVote и AppendEntries по HTTP
 │   └── node/
-│       └── node.go           # Выборы лидера и heartbeat
+│       ├── node.go           # Выборы лидера и AppendEntries
+│       └── log.go            # Добавление, фиксация и просмотр лога
 ├── Makefile
 ├── README.md
 └── go.mod
@@ -182,8 +202,8 @@ make run ARGS="--id=node2 --port=8002 \
   RequestVote, AppendEntries и NodeStatus. Используются `controller`, `node` и `client`.
 - **`entity`** — внутренние роли и состояние узла: term, votedFor,
   leader ID и мьютекс. Используется `node`.
-- **`node`** — ядро алгоритма: переходы состояний, таймеры, запуск RPC к пирам
-  и обработка результатов.
+- **`node`** — ядро алгоритма: переходы состояний, таймеры, RPC к пирам,
+  репликация лога и учёт кворума.
 - **`client`** — отправка RequestVote и AppendEntries по HTTP: сериализация JSON,
   таймаут 400 мс, отмена через контекст и проверка ответов.
 - **`controller`** — обработчики HTTP: декодирование и валидация JSON,
@@ -223,13 +243,12 @@ Part 1 реализует выборы лидера по §5.2 статьи:
    кандидата, если:
    - `term` кандидата не меньше его собственного,
    - он ещё не голосовал в этом терме (или голосовал за этого же кандидата),
-   - лог кандидата не менее актуален (в Part 1 лог пуст — проверка
-     тривиальна).
+   - лог кандидата не менее актуален: сначала сравнивается term последней
+     записи, затем её индекс.
 4. **Победа.** Набрав голоса строгого большинства `(N/2 + 1)`, кандидат
    становится лидером и запускает цикл heartbeat'ов.
 5. **Heartbeat.** Лидер каждые `HeartbeatInterval` (100 мс по умолчанию)
-   рассылает пустые `AppendEntries`. Получив такой RPC, фолловер сбрасывает
-   таймер и остаётся фолловером.
+   рассылает `AppendEntries`. Когда новых записей нет, это пустой heartbeat.
 6. **Обнаружение устаревшего лидера.** Если узел видит `term` больше
    своего — он немедленно становится фолловером и сбрасывает таймер.
 
@@ -242,13 +261,17 @@ Part 1 хранит `currentTerm` и `votedFor` только в памяти: п
 У лидера таймер выборов отключён; heartbeat отправляется сразу после победы.
 Ctrl+C останавливает таймеры, отменяет исходящие RPC и завершает HTTP-сервер.
 
-DTO содержат поля текущего этапа: `last_log_index`, `last_log_term` и
-`leader_commit` пока отсутствуют; они понадобятся при реализации репликации лога.
+Part 2 хранит записи с term и JSON-командой в памяти. Лидер реплицирует записи
+через `AppendEntries`, проверяет предшествующую запись у фолловера, при
+несовпадении уменьшает `nextIndex` и повторяет RPC. Фолловер удаляет
+конфликтующий неподтверждённый суффикс. Лидер увеличивает `commitIndex` для
+записи текущего term после подтверждения большинством и сообщает индекс
+фолловерам в следующих RPC. Выборы учитывают свежесть лога кандидата.
+Применение команд к key-value состоянию относится к Part 3.
 
-REST API использует Gin. `/append_entries` принимает только пустые heartbeat:
-`entries: []`, `null` или отсутствие поля. Непустые `entries` возвращают HTTP 400.
-Ссылка на отсутствующую запись (`prev_log_index` / `prev_log_term`) возвращает
-`success: false`. Некорректный JSON, пустые ID и отрицательные поля возвращают 400.
+REST API использует Gin. Ссылка на отсутствующую запись
+(`prev_log_index` / `prev_log_term`) возвращает `success: false`.
+Некорректный JSON, пустые ID и отрицательные поля возвращают HTTP 400.
 CLI принимает только `--id`, `--port`, `--peers`.
 
 Подробности — в Figure 2 и §5.1–5.2 статьи (`docs/raft.pdf`).

@@ -9,6 +9,10 @@ type State struct {
 	VotedFor    string
 	State       NodeState
 	LeaderID    string
+	Log         []LogEntry
+	CommitIndex int
+	NextIndex   map[string]int
+	MatchIndex  map[string]int
 }
 
 func NewState() *State {

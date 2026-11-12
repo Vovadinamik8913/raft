@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Vovadinamik8913/raft/internal/node"
+	node "github.com/Vovadinamik8913/raft/internal/core"
 	"github.com/rs/zerolog/log"
 )
 
